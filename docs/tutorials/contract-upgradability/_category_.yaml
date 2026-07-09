@@ -1,0 +1,8 @@
+position: 60
+label: 'Contract upgradability'
+description: "Advanced: deploy an upgradable contract, swap a live verifier key, and rotate the maintenance authority."
+collapsible: true # make the category collapsible
+collapsed: true # keep the category closed by default
+link:
+  type: doc
+  id: tutorials/contract-upgradability/index

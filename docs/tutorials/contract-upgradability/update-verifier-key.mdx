@@ -1,0 +1,167 @@
+---
+SPDX-License-Identifier: Apache-2.0
+copyright: This file is part of midnight-docs. Copyright (C) Midnight Foundation. Licensed under the Apache License, Version 2.0 (the "License"); You may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+sidebar_label: "Swap a verifier key"
+title: "Update a live contract by swapping a verifier key"
+description: "Remove the increment circuit's verifier key and insert version two's, changing the call's behavior at the same contract address, and confirm the delta."
+sidebar_position: 5
+toc_max_heading_level: 2
+tags: ["tutorial", "contract-upgradability", "midnight-js", "verifier-key", "update"]
+---
+
+# Update a live contract by swapping a verifier key
+
+This is the update. You remove the verifier key for the `increment` circuit and insert version two's key in its place, and the same `increment()` call starts adding one more than it did before. The contract address, the ledger state, and the balance all stay exactly where they were.
+
+`src/update-to-v2.ts` runs the whole sequence and prints the before-and-after deltas so you can see the behavior change directly.
+
+## Prerequisites
+
+- A version one deployment exists, with `MN_UPGRADE_CONTRACT_ADDRESS` and `MN_UPGRADE_SIGNING_KEY` set.
+- Both contract versions are compiled with the full ZK pipeline. The update reads real verifier keys from both `keys/` directories.
+
+## What this operation does
+
+The script performs an ordered sequence and verifies its own assumptions along the way:
+
+1. Compare the verifier keys across versions; `getCounter` and `getStep` must match, `increment` must differ.
+2. Join the deployment with the version one view.
+3. Call `increment()` once to establish a baseline delta.
+4. Remove the `increment` verifier key.
+5. Insert version two's `increment` verifier key.
+6. Re-join the same address with the version two view.
+7. Call `increment()` again and compare the new delta.
+
+The baseline delta should equal `step`. The post-update delta should equal `step + 1`. The address should not move.
+
+## Guard: compare verifier keys
+
+The script refuses to run if the swap would be a no-op. It compares the keys first and throws if `increment` is identical across versions.
+
+```typescript title="src/update-to-v2.ts"
+const verifierComparison = await compareVersionVerifierKeys();
+
+console.log(
+  `[upgrade] verifier-key equality getCounter=${verifierComparison.getCounterEqual} ` +
+    `getStep=${verifierComparison.getStepEqual} increment=${verifierComparison.incrementEqual}`,
+);
+if (verifierComparison.incrementEqual) {
+  throw new Error('v1 and v2 increment verifier keys are identical; refusing to run maintenance update');
+}
+```
+
+```text
+[upgrade] verifier-key equality getCounter=true getStep=true increment=false
+```
+
+`getCounter=true` and `getStep=true` confirm those circuits are unchanged, so their on-chain keys stay valid after the swap. `increment=false` confirms there is a real difference to apply.
+
+## Establish the version one baseline
+
+The script joins with the version one view, verifies the on-chain keys match what it loaded, reads the ledger, and calls `increment()` once. The delta this produces is the baseline: how much the counter moves under version one.
+
+```typescript title="src/update-to-v2.ts"
+const foundV1 = await joinDeployedContract(v1Runtime.providers, v1Runtime.compiledContract, contractAddress, signingKey);
+await verifyOnChainKeysMatch(v1Runtime.providers, CIRCUIT_IDS, contractAddress);
+
+const before = await readLedgerState(v1Runtime.providers, v1Runtime.contractModule, contractAddress);
+
+const beforeIncrement = await foundV1.callTx.increment();
+const afterBaseline = await readLedgerState(v1Runtime.providers, v1Runtime.contractModule, contractAddress);
+const baselineDelta = asBigInt(afterBaseline.ledger?.counter ?? 0n) - asBigInt(before.ledger?.counter ?? 0n);
+console.log(`[upgrade] baseline increment delta=${baselineDelta}`);
+```
+
+```text
+[upgrade] before update counter=0 step=1
+[upgrade] baseline increment delta=1
+```
+
+With `step` at `1`, the baseline delta is `1`. This is version one behaving as written.
+
+## Remove the old verifier key
+
+The swap is two operations, and order matters. Remove first: this deletes the `increment` verifier key from the contract, and the ledger will reject any `increment` call that tries to use the removed version.
+
+```typescript title="src/update-to-v2.ts"
+const removeResult = await foundV1.circuitMaintenanceTx.increment.removeVerifierKey();
+console.log(`[upgrade] removed increment verifier key txId=${getFinalizedTxId(removeResult) ?? 'unknown'}`);
+```
+
+:::caution
+Between the remove and the insert, the `increment` circuit has no verifier key and cannot be called. Always remove before inserting: a key for a given version must not already exist when you insert it, so you clear the slot first. The script runs both steps back to back to keep that window short. See [`removeVerifierKey`](/api-reference/midnight-js/@midnight-ntwrk/midnight-js-contracts/type-aliases/CircuitMaintenanceTxInterface#removeverifierkey).
+:::
+
+## Insert the new verifier key
+
+Insert version two's `increment` key, which `compareVersionVerifierKeys` already handed back as `incrementV2`.
+
+```typescript title="src/update-to-v2.ts"
+const insertResult = await foundV1.circuitMaintenanceTx.increment.insertVerifierKey(verifierComparison.incrementV2);
+console.log(`[upgrade] inserted v2 increment verifier key txId=${getFinalizedTxId(insertResult) ?? 'unknown'}`);
+```
+
+The `increment` circuit now verifies against version two's rules. `getCounter` and `getStep` were never touched, so they keep working against their original keys. See [`insertVerifierKey`](/api-reference/midnight-js/@midnight-ntwrk/midnight-js-contracts/type-aliases/CircuitMaintenanceTxInterface#insertverifierkey).
+
+## Confirm the new behavior
+
+The script re-joins the same address with the version two view, verifies the on-chain keys again, and calls `increment()` once more. The delta this time reflects version two.
+
+```typescript title="src/update-to-v2.ts"
+v2Runtime = await createRuntime(config, env.mnemonic, 'v2');
+const foundV2 = await joinDeployedContract(v2Runtime.providers, v2Runtime.compiledContract, contractAddress, signingKey);
+await verifyOnChainKeysMatch(v2Runtime.providers, CIRCUIT_IDS, contractAddress);
+
+const beforePostUpdate = await readLedgerState(v2Runtime.providers, v2Runtime.contractModule, contractAddress);
+const afterUpdateIncrement = await foundV2.callTx.increment();
+const afterPostUpdate = await readLedgerState(v2Runtime.providers, v2Runtime.contractModule, contractAddress);
+const postUpdateDelta = asBigInt(afterPostUpdate.ledger?.counter ?? 0n) - asBigInt(beforePostUpdate.ledger?.counter ?? 0n);
+console.log(`[upgrade] post-update increment delta=${postUpdateDelta}`);
+```
+
+The join targets the same `contractAddress` it started with. Nothing about the contract's identity changed; only the key behind `increment` did.
+
+## Run it
+
+```bash
+export MN_UPGRADE_CONTRACT_ADDRESS="<deployed address>"
+export MN_UPGRADE_SIGNING_KEY="<current maintenance signing key>"
+npm run update:v2
+```
+
+The run ends with a summary object:
+
+```text
+[upgrade] baseline increment delta=1
+[upgrade] post-update increment delta=2
+{
+  "contractAddress": "0200...",
+  "baselineDelta": "1",
+  "postUpdateDelta": "2",
+  "maintenanceTxs": {
+    "removeIncrement": "...",
+    "insertIncrement": "..."
+  },
+  "manifestUpdatedToVersion": "v2"
+}
+```
+
+After the update succeeds, set `MN_UPGRADE_CONTRACT_VERSION=v2` so later operations join with the version two view.
+
+```bash
+export MN_UPGRADE_CONTRACT_VERSION=v2
+```
+
+## What changed
+
+| Measurement | Before update | After update |
+|-------------|---------------|--------------|
+| `increment()` delta | `step` (`1`) | `step + 1` (`2`) |
+| Contract address | `0200...` | `0200...` (unchanged) |
+| Ledger state and balance | preserved | preserved |
+
+One call, two different results, one address. That is a verifier-key update.
+
+## Next steps
+
+The contract is running version two's `increment`. [Rotate the maintenance authority](./rotate-authority.mdx) to hand control to a new key.
