@@ -1,0 +1,133 @@
+---
+SPDX-License-Identifier: Apache-2.0
+copyright: This file is part of midnight-docs. Copyright (C) Midnight Foundation. Licensed under the Apache License, Version 2.0 (the "License"); You may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+sidebar_label: "Overview"
+title: "Update a live contract with a maintenance authority"
+description: "Deploy an upgradable Midnight contract, swap a live circuit's verifier key, and rotate the maintenance authority, all at a fixed contract address."
+sidebar_position: 1
+toc_max_heading_level: 2
+tags: ["tutorial", "contract-upgradability", "compact", "midnight-js", "maintenance-authority", "verifier-key"]
+---
+
+# Update a live contract with a maintenance authority
+
+This tutorial takes a deployed contract through its full maintenance lifecycle: deploy it with a Contract Maintenance Authority, swap the verifier key of one of its circuits so the same call behaves differently, then rotate the authority to a new key. The whole sequence runs on a live network against a funded wallet.
+
+The counter you deploy is deliberately minimal, so the mechanics stay in focus. The invariant to watch across every step is the one that makes updatability worth having: the contract's **address, ledger state, and balance never change**. Only the verifier keys and the authority behind them do.
+
+## How contract updatability works
+
+Each circuit in a Compact contract compiles to a zero-knowledge circuit, and each circuit is represented on-chain by a **verifier key**: the cryptographic key the ledger uses to check that circuit's proofs. Change a circuit's verifier key and you change which proofs the contract will accept for that entry point. That is the whole mechanism behind an update.
+
+Only a **Contract Maintenance Authority (CMA)** can insert or remove verifier keys, or replace the CMA itself. Updatability is opt-in. A newly deployed contract defaults to an empty maintenance committee with a threshold of `1`, a condition that can never be satisfied, so the contract is permanently non-upgradable unless you set an authority at deploy time. You enable updatability by passing a `signingKey` when you deploy.
+
+For the reasoning behind this design, when to enable updatability, and the security posture a production authority needs, read [making a decision on contract updatability](/guides/making-decision-on-contract-updatability). This tutorial is the hands-on counterpart to that guide.
+
+## Why two contract versions with the same ABI
+
+You compile two versions of the counter. Version one increments by `step`; version two increments by `step + 1`. Both expose the same circuits with the same names and argument shapes: `increment`, `getCounter`, and `getStep`. Only the body of `increment` differs.
+
+Identical signatures matter because a verifier key maps to a circuit by its id. Swapping the key for `increment` replaces the proving and verification rules for that one circuit while leaving `getCounter` and `getStep` untouched. The result is a behavior change with no ABI drift and no new address.
+
+| Circuit | Verifier key changes v1 to v2 | Why |
+|---------|-------------------------------|-----|
+| `increment` | Yes | The circuit body differs, so it compiles to a different circuit and a different key. |
+| `getCounter` | No | Identical body, identical key. The update leaves it in place. |
+| `getStep` | No | Identical body, identical key. The update leaves it in place. |
+
+The update in [part four](./update-verifier-key.mdx) verifies exactly this before it touches anything: `getCounter` and `getStep` keys must match across versions, and `increment` must differ. If `increment` matched, the swap would be a no-op and the script refuses to run.
+
+## Prerequisites
+
+- [Node.js v22+](https://nodejs.org/) (use `nvm install 22` if needed).
+- [Compact toolchain](/getting-started/installation) installed and on your `PATH`.
+- A BIP-39 wallet mnemonic funded on your target network. The example defaults to **Preprod**; **Preview** is also supported. Fund it from the network faucet before you start.
+- Prior comfort with Compact and the Midnight providers model. If you are new to writing Compact contracts, work through the [bulletin board tutorial](/tutorials/bboard) first.
+
+The example points at a **hosted proof server** (`https://lace-proof-pub.preprod.midnight.network`), so you do not run one locally. To use your own proof server, override `MN_UPGRADE_PROOF_SERVER`.
+
+:::warning
+This tutorial submits real transactions to a shared testnet and performs a one-way sequence against a single contract address: deploy, increment, remove a verifier key, insert a new one, then rotate the authority. Losing the maintenance signing key permanently freezes upgradability for that contract. Deploy a throwaway contract for the walkthrough, not one you intend to keep.
+:::
+
+## The maintenance signing key
+
+The authority is a keypair. The **signing key** is the private half. Whoever holds it can perform every maintenance action on the contract, so it is custody-critical, and the deploy script prints it exactly once. The **verifying key** is the public half; it is what the manifest and the contract record, and it is safe to store.
+
+The example generates signing keys with [`sampleSigningKey`](/api-reference/compact-runtime/functions/sampleSigningKey) and derives the public half with `signatureVerifyingKey`. Rotation, in [part five](./rotate-authority.mdx), swaps which keypair is authoritative.
+
+## Get the example
+
+Clone the example repository. It contains the two contracts, the scripts you run in each part, and the supporting runtime code.
+
+```bash
+git clone https://github.com/midnightntwrk/midnight-contract-upgradability
+cd midnight-contract-upgradability
+```
+
+## Project structure
+
+```text
+midnight-contract-upgradability/
+├── contracts/
+│   ├── upgradable-counter-v1.compact   # increments by step
+│   ├── upgradable-counter-v2.compact   # increments by step + 1
+│   └── managed/                        # compiler output (generated, gitignored)
+├── src/
+│   ├── config.ts            # env parsing, network endpoints, artifact paths
+│   ├── providers.ts         # wallet facade, key derivation, providers bundle
+│   ├── contract-loader.ts   # loads a compiled managed contract
+│   ├── manifest.ts          # non-secret deployment manifest read/write
+│   ├── runtime.ts           # shared join / read / verify helpers
+│   ├── deploy-v1.ts         # deploy with an explicit CMA
+│   ├── inspect-deployment.ts# re-join and read maintenance interfaces
+│   ├── update-to-v2.ts      # swap the increment verifier key
+│   └── rotate-authority.ts  # replace the maintenance authority
+├── data/                    # latest-deployment.json (generated, gitignored)
+├── .env                     # your configuration (gitignored)
+└── package.json
+```
+
+## Configure the environment
+
+Copy the template and fill in your wallet mnemonic. Every script loads `.env` through `dotenv` when it imports `src/config.ts`.
+
+```bash
+cp .env.example .env
+```
+
+The scripts read a single family of `MN_UPGRADE_*` variables.
+
+| Variable | Required for | Default |
+|----------|--------------|---------|
+| `MN_UPGRADE_WALLET_MNEMONIC` | every command | none, must be set |
+| `MN_UPGRADE_NETWORK` | optional | `preprod` (or `preview`) |
+| `MN_UPGRADE_SIGNING_KEY` | `inspect`, `update:v2`, `rotate:authority` | sampled on deploy if unset |
+| `MN_UPGRADE_NEW_SIGNING_KEY` | optional for `rotate:authority` | sampled if unset |
+| `MN_UPGRADE_CONTRACT_ADDRESS` | `inspect`, `update:v2`, `rotate:authority` | falls back to the manifest |
+| `MN_UPGRADE_CONTRACT_VERSION` | join operations | `v1` |
+| `MN_UPGRADE_INITIAL_COUNTER` | `deploy:v1` | `0` |
+| `MN_UPGRADE_INITIAL_STEP` | `deploy:v1` | `1` |
+
+Endpoint overrides (`MN_UPGRADE_INDEXER`, `MN_UPGRADE_NODE`, `MN_UPGRADE_PROOF_SERVER`, and their WebSocket variants) let you point at your own infrastructure. Leave them unset to use the hosted defaults for your network.
+
+The typical run follows this order:
+
+1. `npm run deploy:v1`
+2. Copy the printed maintenance signing key into `MN_UPGRADE_SIGNING_KEY`.
+3. Set `MN_UPGRADE_CONTRACT_ADDRESS` from the deploy output.
+4. `npm run inspect`
+5. `npm run update:v2`, then set `MN_UPGRADE_CONTRACT_VERSION=v2`.
+6. `npm run rotate:authority`
+
+## Tutorial sections
+
+Complete the parts in order. Each one builds on the deployment the previous one left behind.
+
+| Section | What you do |
+|---------|-------------|
+| [Part 1: Versioned contracts](./smart-contract.mdx) | Write and compile the two counter contracts that share an ABI. |
+| [Part 2: Wallet and providers](./project-setup.mdx) | Build the wallet facade, providers bundle, and shared maintenance helpers. |
+| [Part 3: Deploy with a CMA](./deploy-and-inspect.mdx) | Deploy version one with an authority, then re-join and inspect it. |
+| [Part 4: Swap a verifier key](./update-verifier-key.mdx) | Replace the `increment` verifier key and confirm the behavior change. |
+| [Part 5: Rotate the authority](./rotate-authority.mdx) | Replace the maintenance authority with a new signing key. |

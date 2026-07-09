@@ -1,0 +1,61 @@
+---
+SPDX-License-Identifier: Apache-2.0
+copyright: This file is part of midnight-docs. Copyright (C) Midnight Foundation. Licensed under the Apache License, Version 2.0 (the "License"); You may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+title: Contract upgradability
+description: Deploy an upgradable Midnight contract with a maintenance authority, swap a live circuit's verifier key to change its behavior, and rotate the authority to a new key.
+sidebar_position: 60
+tags:
+  - tutorials
+  - contract-upgradability
+  - compact
+  - midnight-js
+  - advanced
+  - midnight-network
+---
+
+import PersonaTiles from '@site/src/components/PersonaTiles';
+
+# Contract upgradability
+
+A deployed Midnight contract is tied to the proof system that compiled it. When that proof system evolves, a contract's circuits can stop verifying, and a contract whose proofs no longer verify is a contract nobody can call. A Contract Maintenance Authority is how you keep the contract alive: it can replace a circuit's verifier key in place, without moving the contract's address, state, or balance.
+
+This tutorial deploys an upgradable counter with an explicit maintenance authority, swaps the verifier key of a live circuit so the same call produces different behavior, then rotates the authority to a fresh key. Every step runs against a real network with a funded wallet.
+
+<PersonaTiles tiles={[
+  {
+    title: "Overview",
+    body: "How verifier-key updates work, what you build, prerequisites, and the environment you configure once.",
+    to: "/tutorials/contract-upgradability/overview",
+    cta: "Read overview",
+  },
+  {
+    title: "Versioned contracts",
+    body: "Two counter contracts that share an identical ABI so a verifier-key swap changes behavior with no address change.",
+    to: "/tutorials/contract-upgradability/smart-contract",
+    cta: "Write the contracts",
+  },
+  {
+    title: "Wallet and providers",
+    body: "Derive keys from a mnemonic, build the wallet facade, assemble the providers bundle, and wire the shared maintenance helpers.",
+    to: "/tutorials/contract-upgradability/project-setup",
+    cta: "Set up the runtime",
+  },
+  {
+    title: "Deploy with a CMA",
+    body: "Deploy version one with an explicit signing key, then re-join the same address and read its maintenance interfaces.",
+    to: "/tutorials/contract-upgradability/deploy-and-inspect",
+    cta: "Deploy the contract",
+  },
+  {
+    title: "Swap a verifier key",
+    body: "Remove the increment circuit's verifier key and insert version two's, changing the call's behavior at a fixed address.",
+    to: "/tutorials/contract-upgradability/update-verifier-key",
+    cta: "Update the contract",
+  },
+  {
+    title: "Rotate the authority",
+    body: "Replace the maintenance authority with a new signing key and confirm the rejoin under the new key.",
+    to: "/tutorials/contract-upgradability/rotate-authority",
+    cta: "Rotate the key",
+  },
+]} />

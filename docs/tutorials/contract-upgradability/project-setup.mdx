@@ -1,0 +1,417 @@
+---
+SPDX-License-Identifier: Apache-2.0
+copyright: This file is part of midnight-docs. Copyright (C) Midnight Foundation. Licensed under the Apache License, Version 2.0 (the "License"); You may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+sidebar_label: "Wallet and providers"
+title: "Wallet, providers, and the shared runtime"
+description: "Derive wallet keys from a mnemonic, build the wallet facade, assemble the providers bundle, and wire the shared helpers the maintenance scripts call."
+sidebar_position: 3
+toc_max_heading_level: 2
+tags: ["tutorial", "contract-upgradability", "midnight-js", "wallet-sdk", "providers"]
+---
+
+# Wallet, providers, and the shared runtime
+
+Every script in this tutorial does the same setup before it touches the contract: build a wallet from your mnemonic, wait for it to sync and confirm it has funds, then assemble the providers the Midnight SDK needs. This part covers that shared machinery and the helper functions the deploy, update, and rotate scripts call. The files here are read, not run; you exercise them starting in [part three](./deploy-and-inspect.mdx).
+
+## Prerequisites
+
+- [Both contract versions are compiled](./smart-contract.mdx) with the full ZK pipeline.
+- Your `.env` has a funded `MN_UPGRADE_WALLET_MNEMONIC`.
+
+## Install dependencies
+
+```bash
+npm install
+```
+
+The install pulls the wallet SDK, the contracts SDK, and the provider packages the scripts depend on.
+
+| Package | Role |
+|---------|------|
+| `@midnight-ntwrk/wallet-sdk-facade` | Wallet facade coordinating shielded, unshielded, and dust wallets. |
+| `@midnight-ntwrk/wallet-sdk-hd` | HD wallet key derivation from a BIP-39 seed. |
+| `@midnight-ntwrk/midnight-js-contracts` | `deployContract`, `findDeployedContract`, and the maintenance interfaces. |
+| `@midnight-ntwrk/midnight-js-indexer-public-data-provider` | Reads on-chain contract state from the indexer. |
+| `@midnight-ntwrk/midnight-js-http-client-proof-provider` | Talks to the proof server. |
+| `@midnight-ntwrk/midnight-js-node-zk-config-provider` | Loads verifier and prover keys from the managed artifacts. |
+| `@midnight-ntwrk/compact-js` | Wraps a compiled contract into a `CompiledContract`. |
+| `@midnight-ntwrk/compact-runtime` | `sampleSigningKey`, `signatureVerifyingKey`, and runtime types. |
+
+:::note
+The example pins exact versions of the wallet SDK 1.0 packages in `package.json`. This part of the stack moves quickly, so match those versions rather than taking the latest. The wallet and signing code below is written against that specific release.
+:::
+
+## Configuration
+
+`src/config.ts` parses the environment, resolves per-network endpoints, and locates the compiled artifacts. It exports two functions the scripts call at startup: `loadUpgradeEnv` reads and validates the `MN_UPGRADE_*` variables, and `resolveConfig` picks the endpoint bundle for the chosen network and calls `setNetworkId`.
+
+```typescript title="src/config.ts"
+import 'dotenv/config';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { setNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
+
+export type SupportedNetwork = 'preview' | 'preprod';
+export type ContractVersion = 'v1' | 'v2';
+
+export interface UpgradeEnv {
+  readonly network: SupportedNetwork;
+  readonly mnemonic: string;
+  readonly signingKey?: string;
+  readonly newSigningKey?: string;
+  readonly contractAddress?: string;
+  readonly version: ContractVersion;
+  readonly initialCounter: bigint;
+  readonly initialStep: bigint;
+}
+
+const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+export const contractArtifacts = {
+  v1: {
+    contractName: 'upgradable-counter-v1',
+    managedPath: path.resolve(rootDir, 'contracts', 'managed', 'upgradable-counter-v1'),
+  },
+  v2: {
+    contractName: 'upgradable-counter-v2',
+    managedPath: path.resolve(rootDir, 'contracts', 'managed', 'upgradable-counter-v2'),
+  },
+} as const;
+```
+
+`contractArtifacts` maps each version to its contract name and the managed directory produced by `npm run compile`. The loader and the verifier-key comparison both resolve paths through this map, so the two versions can be loaded side by side.
+
+The endpoint bundles carry the indexer, node, and proof server URLs for each network.
+
+```typescript title="src/config.ts"
+const preprodConfig: UpgradeConfig = {
+  network: 'preprod',
+  indexer: 'https://indexer.preprod.midnight.network/api/v3/graphql',
+  indexerWS: 'wss://indexer.preprod.midnight.network/api/v3/graphql/ws',
+  node: 'https://rpc.preprod.midnight.network',
+  nodeWs: 'wss://rpc.preprod.midnight.network',
+  proofServer: 'https://lace-proof-pub.preprod.midnight.network',
+  privateStateStoreName: 'upgradable-counter-private-state-preprod',
+};
+```
+
+A `preview` bundle mirrors it with `preview` hosts. `resolveConfig` selects the bundle by network, applies any `MN_UPGRADE_*` endpoint overrides, and calls `setNetworkId(env.network)` so the rest of the SDK addresses and serializes for the right network. `loadUpgradeEnv` validates the numeric inputs; `MN_UPGRADE_INITIAL_COUNTER` and `MN_UPGRADE_INITIAL_STEP` are parsed as unsigned integers and rejected if they do not fit in `Uint<64>`.
+
+## Derive keys and build the wallet
+
+`src/providers.ts` is the largest file. It derives wallet keys from your mnemonic, builds the wallet facade, waits for sync and funds, and assembles the providers bundle. The whole file goes in `src/providers.ts`; the sections below walk through it in order.
+
+It opens by installing a `WebSocket` implementation on `globalThis`, which the indexer and node clients need under Node.
+
+```typescript title="src/providers.ts"
+import { type ContractAddress } from '@midnight-ntwrk/compact-runtime';
+import { nativeToken } from '@midnight-ntwrk/ledger-v7';
+import { httpClientProofProvider } from '@midnight-ntwrk/midnight-js-http-client-proof-provider';
+import { indexerPublicDataProvider } from '@midnight-ntwrk/midnight-js-indexer-public-data-provider';
+import { levelPrivateStateProvider } from '@midnight-ntwrk/midnight-js-level-private-state-provider';
+import { NodeZkConfigProvider } from '@midnight-ntwrk/midnight-js-node-zk-config-provider';
+import { WalletFacade } from '@midnight-ntwrk/wallet-sdk-facade';
+import { HDWallet, Roles } from '@midnight-ntwrk/wallet-sdk-hd';
+import {
+  createKeystore,
+  InMemoryTransactionHistoryStorage,
+  PublicKey,
+  UnshieldedWallet,
+} from '@midnight-ntwrk/wallet-sdk-unshielded-wallet';
+import { MidnightBech32m } from '@midnight-ntwrk/wallet-sdk-address-format';
+import { ShieldedWallet } from '@midnight-ntwrk/wallet-sdk-shielded';
+import { DustWallet } from '@midnight-ntwrk/wallet-sdk-dust-wallet';
+import * as ledger from '@midnight-ntwrk/ledger-v7';
+import * as Rx from 'rxjs';
+import { WebSocket } from 'ws';
+import type { UpgradeConfig, SupportedNetwork } from './config.js';
+
+globalThis.WebSocket = WebSocket as unknown as typeof globalThis.WebSocket;
+```
+
+Key derivation turns the mnemonic into a seed, builds an HD wallet, and derives the three role keys a Midnight wallet uses: `Zswap` for shielded funds, `NightExternal` for unshielded NIGHT, and `Dust` for fee-paying dust. It clears the HD wallet from memory once the keys are out.
+
+```typescript title="src/providers.ts"
+const deriveKeysFromMnemonic = async (mnemonic: string) => {
+  const { mnemonicToSeedSync } = await import('@scure/bip39');
+  const normalized = mnemonic.normalize('NFKD').trim();
+  const seed = mnemonicToSeedSync(normalized);
+  const hdWallet = HDWallet.fromSeed(seed);
+  if (hdWallet.type !== 'seedOk') {
+    throw new Error('Failed to initialize HD wallet from mnemonic');
+  }
+
+  const derivation = hdWallet.hdWallet
+    .selectAccount(0)
+    .selectRoles([Roles.Zswap, Roles.NightExternal, Roles.Dust])
+    .deriveKeysAt(0);
+
+  if (derivation.type !== 'keysDerived') {
+    throw new Error('Failed to derive wallet keys');
+  }
+
+  hdWallet.hdWallet.clear();
+  return {
+    zswap: derivation.keys[Roles.Zswap],
+    night: derivation.keys[Roles.NightExternal],
+    dust: derivation.keys[Roles.Dust],
+  };
+};
+```
+
+`buildWallet` turns those role keys into the three underlying wallets and composes them into a single `WalletFacade`. The facade is the object the rest of the code drives: it exposes one synced state stream and one balancing and submission path across all three wallets.
+
+```typescript title="src/providers.ts"
+export const buildWallet = async (config: UpgradeConfig, mnemonic: string): Promise<WalletBundle> => {
+  const keys = await deriveKeysFromMnemonic(mnemonic);
+  const shieldedSecretKeys = ledger.ZswapSecretKeys.fromSeed(keys.zswap);
+  const dustSecretKey = ledger.DustSecretKey.fromSeed(keys.dust);
+  const unshieldedKeystore = createKeystore(keys.night, config.network);
+  const walletConfig = buildWalletConfiguration(config);
+
+  const shieldedWallet = ShieldedWallet(walletConfig).startWithSecretKeys(shieldedSecretKeys as any);
+  const dustWallet = DustWallet(walletConfig).startWithSecretKey(
+    dustSecretKey as any,
+    ledger.LedgerParameters.initialParameters().dust as unknown as Parameters<
+      ReturnType<typeof DustWallet>['startWithSecretKey']
+    >[1],
+  );
+  const unshieldedWallet = UnshieldedWallet({
+    ...walletConfig,
+    txHistoryStorage: new InMemoryTransactionHistoryStorage(),
+  }).startWithPublicKey(PublicKey.fromKeyStore(unshieldedKeystore));
+
+  const wallet = new WalletFacade(shieldedWallet, unshieldedWallet, dustWallet);
+  await wallet.start(shieldedSecretKeys as any, dustSecretKey as any);
+
+  return { wallet, shieldedSecretKeys, dustSecretKey, unshieldedKeystore, network: config.network };
+};
+```
+
+## Sync and confirm funds
+
+The wallet has to be synced before it can build a transaction, and it needs a balance before it can pay for one. `ensureWalletReady` waits for both: it blocks on sync, snapshots the balances, and if everything is zero it waits for funds to arrive.
+
+```typescript title="src/providers.ts"
+const waitForSync = (wallet: WalletFacade) =>
+  Rx.firstValueFrom(
+    wallet.state().pipe(
+      Rx.throttleTime(5_000),
+      Rx.tap((state) => {
+        console.log('[upgrade] sync progress', {
+          shielded: state.shielded.progress,
+          unshielded: state.unshielded.progress,
+          dust: state.dust.progress,
+        });
+      }),
+      Rx.filter((state) => state.isSynced),
+    ),
+  );
+
+export const ensureWalletReady = async (
+  wallet: WalletFacade,
+  network: SupportedNetwork,
+): Promise<WalletStateSnapshot> => {
+  await waitForSync(wallet);
+  const snapshot = await getWalletSnapshot(wallet, network);
+  if (snapshot.shieldedBalance === 0n && snapshot.unshieldedBalance === 0n && snapshot.dustBalance === 0n) {
+    await waitForFunds(wallet);
+    return getWalletSnapshot(wallet, network);
+  }
+  return snapshot;
+};
+```
+
+The wallet state is an RxJS stream. `waitForSync` logs throttled progress and resolves on the first fully synced state; `waitForFunds` resolves once any balance is non-zero. `getWalletSnapshot` reads the current balances and prints the wallet's shielded address.
+
+:::caution
+An unsynced or unfunded wallet is the most common way this tutorial stalls. `ensureWalletReady` will wait indefinitely at the sync or funds step if the mnemonic has no balance on the target network. If a script hangs after `[upgrade] sync progress` lines, fund the wallet from the faucet and check `MN_UPGRADE_NETWORK` matches where the funds are.
+:::
+
+## Assemble the providers bundle
+
+`createProviders` builds the object the contracts SDK expects: a private-state provider, a public-data provider reading from the indexer, a ZK config provider loading keys from the managed directory, a proof provider, and a wallet provider that handles balancing, signing, and submission.
+
+```typescript title="src/providers.ts"
+export const createProviders = async (
+  wallet: WalletFacade,
+  config: UpgradeConfig,
+  keys: { shieldedSecretKeys: ledger.ZswapSecretKeys; dustSecretKey: ledger.DustSecretKey },
+  unshieldedKeystore: ReturnType<typeof createKeystore>,
+  zkConfigPath: string,
+): Promise<UpgradeProviders> => {
+  const state = await Rx.firstValueFrom(wallet.state().pipe(Rx.filter((value) => value.isSynced)));
+  const walletProvider = {
+    getCoinPublicKey() {
+      return state.shielded.coinPublicKey.toHexString();
+    },
+    getEncryptionPublicKey() {
+      return state.shielded.encryptionPublicKey.toHexString();
+    },
+    async balanceTx(tx: unknown) {
+      const recipe = await wallet.balanceUnboundTransaction(
+        tx as never,
+        { shieldedSecretKeys: keys.shieldedSecretKeys, dustSecretKey: keys.dustSecretKey },
+        { ttl: new Date(Date.now() + 60 * 60 * 1000) },
+      );
+
+      const signFn = (payload: Uint8Array) => unshieldedKeystore.signData(payload);
+      if ((recipe as any).baseTransaction) {
+        signTransactionIntents((recipe as any).baseTransaction, signFn, 'proof');
+      }
+      if ((recipe as any).balancingTransaction) {
+        signTransactionIntents((recipe as any).balancingTransaction, signFn, 'pre-proof');
+      }
+      return wallet.finalizeRecipe(recipe as never) as Promise<any>;
+    },
+    submitTx(tx: unknown) {
+      return wallet.submitTransaction(tx as never) as Promise<any>;
+    },
+  };
+
+  return {
+    privateStateProvider: levelPrivateStateProvider({
+      privateStateStoreName: config.privateStateStoreName,
+      walletProvider: walletProvider as any,
+    }),
+    publicDataProvider: indexerPublicDataProvider(config.indexer, config.indexerWS),
+    zkConfigProvider: new NodeZkConfigProvider<any>(zkConfigPath),
+    proofProvider: httpClientProofProvider(config.proofServer, new NodeZkConfigProvider<any>(zkConfigPath)),
+    walletProvider: walletProvider as any,
+    midnightProvider: walletProvider as any,
+  } as UpgradeProviders;
+};
+```
+
+`balanceTx` is the one piece worth reading closely. It asks the wallet to balance the unbound transaction, signs the unshielded offers on each intent with the keystore, and finalizes the recipe into a submittable transaction. The `signTransactionIntents` helper walks each intent's guaranteed and fallible unshielded offers and attaches a signature per input.
+
+:::info
+Treat the balancing and signing path as boilerplate for this tutorial. It wires the wallet's unshielded signing into the provider contract the SDK calls during `deployContract` and `callTx`. Every maintenance operation you run in the later parts flows through it unchanged.
+:::
+
+## Load a compiled contract
+
+`src/contract-loader.ts` imports a compiled managed contract and wraps it in a `CompiledContract` the SDK can deploy or join.
+
+```typescript title="src/contract-loader.ts"
+import { CompiledContract } from '@midnight-ntwrk/compact-js';
+import { pathToFileURL } from 'node:url';
+import { contractArtifacts, type ContractVersion } from './config.js';
+
+export const loadCompiledContract = async (version: ContractVersion) => {
+  const artifact = contractArtifacts[version];
+  const modulePath = pathToFileURL(`${artifact.managedPath}/contract/index.js`);
+  const contractModule = await import(modulePath.href);
+  const compiledContract = CompiledContract.make(artifact.contractName, contractModule.Contract).pipe(
+    CompiledContract.withVacantWitnesses,
+    CompiledContract.withCompiledFileAssets(artifact.managedPath),
+  );
+
+  return {
+    contractModule,
+    compiledContract,
+    zkConfigPath: artifact.managedPath,
+  };
+};
+```
+
+`withVacantWitnesses` supplies empty witnesses because the counter has no private state. `withCompiledFileAssets` points the contract at the managed directory so it can find its keys. The returned `zkConfigPath` is that same directory, which `createProviders` uses for the ZK config and proof providers.
+
+## Shared maintenance helpers
+
+`src/runtime.ts` collects the operations the deploy, update, and rotate scripts share, so those scripts stay short. `createRuntime` does the full startup in one call: build the wallet, wait for it to be ready, load the compiled contract for a version, and assemble the providers.
+
+```typescript title="src/runtime.ts"
+export const PRIVATE_STATE_ID = 'upgradableCounterPrivateState';
+
+export const joinDeployedContract = async (
+  providers: UpgradeProviders,
+  compiledContract: any,
+  contractAddress: ContractAddress,
+  signingKey?: string,
+) =>
+  findDeployedContract(providers as never, {
+    contractAddress,
+    compiledContract,
+    privateStateId: PRIVATE_STATE_ID,
+    initialPrivateState: {},
+    signingKey,
+  } as never);
+
+export const readLedgerState = async (
+  providers: UpgradeProviders,
+  contractModule: any,
+  contractAddress: ContractAddress,
+) => {
+  const state = await providers.publicDataProvider.queryContractState(contractAddress);
+  return {
+    raw: state,
+    ledger: state ? contractModule.ledger(state.data) : null,
+  };
+};
+```
+
+`joinDeployedContract` wraps `findDeployedContract`, re-opening a contract at a known address. Passing `signingKey` is what lets the returned object perform maintenance. `readLedgerState` queries the indexer for the contract's public state and decodes it through the compiled view, giving you the current `counter` and `step`.
+
+Two more helpers verify keys. `verifyOnChainKeysMatch` confirms the verifier keys the provider loaded match what the ledger records for the contract. `compareVersionVerifierKeys` compares each circuit's key across the two versions, and is the guard the update relies on.
+
+```typescript title="src/runtime.ts"
+export const verifyOnChainKeysMatch = async (
+  providers: UpgradeProviders,
+  circuitIds: string[],
+  contractAddress: ContractAddress,
+) => {
+  const state = await providers.publicDataProvider.queryContractState(contractAddress);
+  if (!state) {
+    throw new Error(`No contract state found at ${contractAddress}`);
+  }
+  const verifierKeys = await providers.zkConfigProvider.getVerifierKeys(circuitIds);
+  verifyContractState(verifierKeys, state);
+};
+
+export const compareVersionVerifierKeys = async () => {
+  const v1Provider = new NodeZkConfigProvider<'getCounter' | 'getStep' | 'increment'>(contractArtifacts.v1.managedPath);
+  const v2Provider = new NodeZkConfigProvider<'getCounter' | 'getStep' | 'increment'>(contractArtifacts.v2.managedPath);
+  const getCounterV1 = await v1Provider.getVerifierKey('getCounter');
+  const getCounterV2 = await v2Provider.getVerifierKey('getCounter');
+  const getStepV1 = await v1Provider.getVerifierKey('getStep');
+  const getStepV2 = await v2Provider.getVerifierKey('getStep');
+  const incrementV1 = await v1Provider.getVerifierKey('increment');
+  const incrementV2 = await v2Provider.getVerifierKey('increment');
+  return {
+    getCounterEqual: verifierKeysEqual(getCounterV1, getCounterV2),
+    getStepEqual: verifierKeysEqual(getStepV1, getStepV2),
+    incrementEqual: verifierKeysEqual(incrementV1, incrementV2),
+    incrementV2,
+  };
+};
+```
+
+`compareVersionVerifierKeys` also returns `incrementV2`, the version two key you insert during the update. The comparison and the key you need both come from one call.
+
+## The deployment manifest
+
+`src/manifest.ts` reads and writes `data/latest-deployment.json`, a non-secret record of the deployment so later scripts can find the contract without you re-typing its address.
+
+```typescript title="src/manifest.ts"
+export interface DeploymentManifest {
+  readonly contractAddress: string;
+  readonly txId: string | null;
+  readonly blockHeight: number | null;
+  readonly compiledVersion: 'v1' | 'v2';
+  readonly initialCounter: string;
+  readonly initialStep: string;
+  readonly maintenanceVerifyingKey: string;
+  readonly network: 'preview' | 'preprod';
+}
+```
+
+The manifest stores the contract address, the compiled version it is currently on, the initial values, and the maintenance **verifying** key. It does not store the signing key. The public half of the authority is safe to record; the private half is yours to keep.
+
+:::warning
+The manifest is the public record of the deployment. The signing key never goes in it, and `data/` is gitignored so a manifest never lands in version control by accident. Store the signing key somewhere else, securely. It is the only thing that can update or re-authorize this contract.
+:::
+
+## Next steps
+
+The runtime is in place. [Deploy version one with a maintenance authority](./deploy-and-inspect.mdx) and read back its maintenance interfaces.

@@ -1,0 +1,130 @@
+---
+SPDX-License-Identifier: Apache-2.0
+copyright: This file is part of midnight-docs. Copyright (C) Midnight Foundation. Licensed under the Apache License, Version 2.0 (the "License"); You may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+sidebar_label: "Versioned contracts"
+title: "The versioned counter contracts"
+description: "Write two counter contracts that share an identical ABI, so swapping one circuit's verifier key changes behavior without changing the contract address."
+sidebar_position: 2
+toc_max_heading_level: 2
+tags: ["tutorial", "contract-upgradability", "compact", "verifier-key"]
+---
+
+# The versioned counter contracts
+
+The update you perform later replaces the verifier key of a single circuit. For that to be a clean swap, the two versions of the contract have to agree on everything except the one circuit whose behavior you want to change. This part writes both versions and compiles them to the full artifacts the update needs.
+
+## Prerequisites
+
+- You have [cloned the example and configured `.env`](./overview.mdx).
+- The [Compact toolchain](/getting-started/installation) is installed and on your `PATH`.
+
+## Version one
+
+`contracts/upgradable-counter-v1.compact` holds a counter and a step, and increments the counter by the step.
+
+```compact title="contracts/upgradable-counter-v1.compact"
+pragma language_version >= 0.20;
+
+import CompactStandardLibrary;
+
+export ledger counter: Uint<64>;
+export ledger step: Uint<64>;
+
+constructor(initialCounter: Uint<64>, initialStep: Uint<64>) {
+    counter = disclose(initialCounter);
+    step = disclose(initialStep);
+}
+
+export circuit increment(): [] {
+    const next: Uint<64> = (counter + step) as Uint<64>;
+    counter = next;
+}
+
+export circuit getCounter(): Uint<64> {
+    return counter;
+}
+
+export circuit getStep(): Uint<64> {
+    return step;
+}
+```
+
+Both `counter` and `step` are `export ledger` fields, so they are public on-chain state and readable through the compiled contract view. The `constructor` seeds them from its arguments; `disclose()` is required because the constructor writes caller-supplied values into public ledger state. `increment` reads both fields, adds them, and writes the result back. `getCounter` and `getStep` return the current values.
+
+## Version two
+
+`contracts/upgradable-counter-v2.compact` is the same contract with one change: `increment` adds an extra `1`.
+
+```compact title="contracts/upgradable-counter-v2.compact"
+pragma language_version >= 0.20;
+
+import CompactStandardLibrary;
+
+export ledger counter: Uint<64>;
+export ledger step: Uint<64>;
+
+constructor(initialCounter: Uint<64>, initialStep: Uint<64>) {
+    counter = disclose(initialCounter);
+    step = disclose(initialStep);
+}
+
+export circuit increment(): [] {
+    const bonus: Uint<64> = 1 as Uint<64>;
+    const next: Uint<64> = (counter + step + bonus) as Uint<64>;
+    counter = next;
+}
+
+export circuit getCounter(): Uint<64> {
+    return counter;
+}
+
+export circuit getStep(): Uint<64> {
+    return step;
+}
+```
+
+The circuit names, their argument shapes, and the ledger declarations are byte-for-byte identical to version one. Only `increment`'s body differs: it computes `counter + step + 1` instead of `counter + step`.
+
+:::note
+Keeping the ABI stable is the whole point of the design. A verifier key is bound to a circuit by its id, so a swap only lands correctly when both versions name the same circuits with the same signatures. If `increment` had a different name or return type in v2, the on-chain circuit id and the compiled TypeScript view would no longer line up, and the rejoin and read steps in later parts would break.
+:::
+
+## Why the ABI must stay stable
+
+A verifier-key update targets one circuit id and replaces the rules for that id alone. `getCounter` and `getStep` are unchanged between versions, so they compile to the same circuits and the same verifier keys, and the update leaves them in place. `increment` changed, so it compiles to a different circuit and a different key, and that key is the one you swap.
+
+This is why the update in [part four](./update-verifier-key.mdx) can change what `increment` does while `getCounter` and `getStep` keep working against the same contract, at the same address, over the same state.
+
+## Compile both versions
+
+Compile each version into its managed artifacts.
+
+```bash
+npm run compile:v1
+npm run compile:v2
+```
+
+Each command writes a managed directory under `contracts/managed/`, containing the compiled contract, the verifier and prover keys, and the ZK intermediate representation.
+
+```text
+contracts/managed/upgradable-counter-v1/
+├── contract/     # compiled contract + generated TypeScript view
+├── keys/         # prover and verifier keys, per circuit
+└── zkir/         # ZK intermediate representation
+```
+
+You should see per-circuit compiler statistics as each version builds:
+
+```text
+Compiling circuit "increment"...
+Compiling circuit "getCounter"...
+Compiling circuit "getStep"...
+```
+
+:::caution
+The example also ships `compile:v1:skip-zk` and `compile:v2:skip-zk` scripts that pass `--skip-zk`. Use them only for quick iteration on contract syntax. Verifier-key maintenance reads real keys from the `keys/` directory, and `--skip-zk` does not produce them. Both versions must be compiled with the full ZK pipeline before you run the update in part four.
+:::
+
+## Next steps
+
+Both versions are compiled and their verifier keys are on disk. [Set up the wallet and providers](./project-setup.mdx) that the deploy and maintenance scripts run against.

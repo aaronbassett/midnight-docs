@@ -1,0 +1,99 @@
+---
+SPDX-License-Identifier: Apache-2.0
+copyright: This file is part of midnight-docs. Copyright (C) Midnight Foundation. Licensed under the Apache License, Version 2.0 (the "License"); You may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+sidebar_label: "Rotate the authority"
+title: "Rotate the maintenance authority"
+description: "Replace the contract maintenance authority with a new signing key and confirm the deployment re-joins under the new key."
+sidebar_position: 6
+toc_max_heading_level: 2
+tags: ["tutorial", "contract-upgradability", "midnight-js", "maintenance-authority", "rotation"]
+---
+
+# Rotate the maintenance authority
+
+The authority that controls a contract is itself replaceable. Rotation swaps the maintenance keypair: the current authority names a successor, and from then on only the new signing key can perform maintenance. `src/rotate-authority.ts` runs the swap and confirms the deployment re-joins under the new key.
+
+## Prerequisites
+
+- The contract is on its desired version, with `MN_UPGRADE_CONTRACT_VERSION` set accordingly (`v2` if you completed the update).
+- `MN_UPGRADE_CONTRACT_ADDRESS` and the current `MN_UPGRADE_SIGNING_KEY` are set.
+
+## Why rotate
+
+Rotation is how you keep control of a contract healthy over its lifetime. Retire a key you suspect is exposed, hand maintenance to a different committee, or relinquish control entirely by handing off to an empty committee. It is one of the three privileged actions a CMA can take, alongside inserting and removing verifier keys.
+
+## Rotate the signing key
+
+The script picks the replacement key, using `MN_UPGRADE_NEW_SIGNING_KEY` if set and sampling a fresh one otherwise, and refuses to rotate to the key already in use.
+
+```typescript title="src/rotate-authority.ts"
+const currentSigningKey = resolveSigningKey(env);
+const newSigningKey = env.newSigningKey ?? sampleSigningKey();
+
+if (newSigningKey === currentSigningKey) {
+  throw new Error('MN_UPGRADE_NEW_SIGNING_KEY must differ from MN_UPGRADE_SIGNING_KEY');
+}
+```
+
+It joins the deployment with the current authority, calls `replaceAuthority` with the new signing key, then re-joins the same address with the new key to prove the rotation took effect.
+
+```typescript title="src/rotate-authority.ts"
+const foundCurrent = await joinDeployedContract(
+  currentRuntime.providers,
+  currentRuntime.compiledContract,
+  contractAddress,
+  currentSigningKey,
+);
+await verifyOnChainKeysMatch(currentRuntime.providers, CIRCUIT_IDS, contractAddress);
+
+const rotateResult = await foundCurrent.contractMaintenanceTx.replaceAuthority(newSigningKey);
+console.log(`[upgrade] replaceAuthority txId=${getFinalizedTxId(rotateResult) ?? 'unknown'}`);
+
+newRuntime = await createRuntime(config, env.mnemonic, env.version);
+const foundNew = await joinDeployedContract(newRuntime.providers, newRuntime.compiledContract, contractAddress, newSigningKey);
+await verifyOnChainKeysMatch(newRuntime.providers, CIRCUIT_IDS, contractAddress);
+```
+
+`replaceAuthority` names the new keypair as the successor authority. The re-join with `newSigningKey` at the same `contractAddress` confirms the new key is now the one that can act. The script then updates the manifest's `maintenanceVerifyingKey` to the new public key.
+
+Run it:
+
+```bash
+export MN_UPGRADE_CONTRACT_ADDRESS="<deployed address>"
+export MN_UPGRADE_SIGNING_KEY="<current maintenance signing key>"
+export MN_UPGRADE_CONTRACT_VERSION=v2
+npm run rotate:authority
+```
+
+```text
+[upgrade] rotating maintenance authority for contract=0200...
+[upgrade] current verifying key=0x...
+[upgrade] new verifying key=0x...
+[upgrade] sampled a fresh replacement authority signing key
+[upgrade] new maintenance signing key=0x...
+[upgrade] replaceAuthority txId=...
+[upgrade] rejoined with new authority at 0200...
+{
+  "contractAddress": "0200...",
+  "newMaintenanceVerifyingKey": "0x...",
+  "replaceAuthorityTxId": "..."
+}
+```
+
+:::warning
+When the script samples the replacement key, it prints it once, the same way the deploy did. Store it securely and update `MN_UPGRADE_SIGNING_KEY` to the new key. Once the rotation lands, the old signing key can no longer perform maintenance on this contract.
+:::
+
+## Verify the old authority is powerless
+
+The re-join under the new key proves the new authority works. It does not, on its own, prove the old key has lost its power. Confirming that takes a deliberate probe: on a disposable deployment, keep the old signing key, rotate to a new one, then attempt a maintenance operation, an `insertVerifierKey` or another `replaceAuthority`, with the old key and confirm the ledger rejects it.
+
+:::note
+Run this check on a throwaway contract, not one you intend to keep. A maintenance attempt with a stale key is exactly the kind of operation you want to observe failing before you rely on rotation in production.
+:::
+
+## What you built
+
+You took a contract through its full maintenance lifecycle. You deployed it with an explicit authority to enable updatability, re-joined it to read its maintenance interfaces, swapped the `increment` verifier key so the same call produced a different result, and rotated the authority to a new key. Through all of it the contract kept one address, one ledger state, and one balance.
+
+That fixed address under changing behavior is what a Contract Maintenance Authority buys you. It is also a standing responsibility. A single signing key is a single point of failure, so a production authority should be a committee of independent keys with a threshold, and you should track proof-system changes so you can update circuits before their proofs stop verifying. The [contract updatability guide](/guides/making-decision-on-contract-updatability) covers that posture, and the [release compatibility matrix](/relnotes/support-matrix) is where you watch for the changes that force an update.
